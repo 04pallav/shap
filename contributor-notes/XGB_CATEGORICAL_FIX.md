@@ -1,7 +1,7 @@
 # XGBoost categorical — fix notes
 
 **Branch:** `fix/xgboost-categorical-gpu` (fork `04pallav/shap` only — no upstream PR)  
-**Back:** [LANE_GPU.md](./LANE_GPU.md) · Tracker: [#4182](https://github.com/shap/shap/issues/4182) categorical item  
+**Theory:** [SHAP_THEORY_README.md](./SHAP_THEORY_README.md) · **Back:** [LANE_GPU.md](./LANE_GPU.md) · Tracker: [#4182](https://github.com/shap/shap/issues/4182) categorical item  
 **Status:** **XGB #2 done** (CPU `tree_path_dependent` + background). See **Not in this PR** below. XGB #3 / #4–6 still open.
 
 ---
