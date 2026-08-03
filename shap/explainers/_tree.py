@@ -131,6 +131,7 @@ class TreeExplainer(Explainer):
     data: npt.NDArray[Any] | None
     data_missing: npt.NDArray[np.bool_] | None
     feature_perturbation: str
+    algorithm: str
     expected_value: Any
     model: TreeEnsemble
     model_output: str
@@ -142,6 +143,7 @@ class TreeExplainer(Explainer):
         data: npt.NDArray[Any] | pd.DataFrame | None = None,
         model_output: str = "raw",
         feature_perturbation: Literal["auto", "interventional", "tree_path_dependent"] = "auto",
+        algorithm: Literal["classic", "quadrature"] = "classic",
         feature_names: list[str] | None = None,
         approximate: Any = DEPRECATED_APPROX,
         # FIXME: The `link` and `linearize_link` arguments are ignored. GH #3513
@@ -215,6 +217,12 @@ class TreeExplainer(Explainer):
             Currently the "probability" and "log_loss" options are only
             supported when ``feature_perturbation="interventional"``.
 
+        algorithm : "classic" (default) or "quadrature"
+            Tree SHAP backend for ``feature_perturbation="tree_path_dependent"``.
+            ``"quadrature"`` uses the fixed 8-point Gauss–Legendre formulation
+            (Quadrature-TreeSHAP, as in XGBoost 3.3+). Other perturbation modes
+            always use the classic Lundberg Tree SHAP implementation.
+
         approximate : bool
             Deprecated, will be deprecated in v0.47.0 and removed in version v0.49.0.
             Please use the ``approximate`` argument in the :meth:`.shap_values` or ``__call__`` methods instead.
@@ -281,10 +289,16 @@ class TreeExplainer(Explainer):
                 f"Got {feature_perturbation} instead."
             )
 
+        if algorithm not in ("classic", "quadrature"):
+            raise ValueError(f"algorithm must be 'classic' or 'quadrature'. Got {algorithm} instead.")
+        if algorithm == "quadrature" and feature_perturbation != "tree_path_dependent":
+            raise ValueError('algorithm="quadrature" requires feature_perturbation="tree_path_dependent".')
+
         _safe_check_tree_instance_experimental(model)
 
         self.data_missing = None if self.data is None else pd.isna(self.data)
         self.feature_perturbation = feature_perturbation
+        self.algorithm = algorithm
         self.expected_value = None
         if isinstance(model, TreeEnsemble):
             # Allow passing a pre-built TreeEnsemble directly. This makes it possible
@@ -684,28 +698,49 @@ class TreeExplainer(Explainer):
         phi = np.zeros((X.shape[0], X.shape[1] + 1, self.model.num_outputs))
 
         if not approximate:
-            _cext.dense_tree_shap(
-                self.model.children_left,
-                self.model.children_right,
-                self.model.children_default,
-                self.model.features,
-                self.model.thresholds,
-                self.model.threshold_types,
-                self.model.values,
-                self.model.node_sample_weight,
-                self.model.max_depth,
-                X,
-                X_missing,
-                y,
-                self.data,
-                self.data_missing,
-                tree_limit,
-                self.model.base_offset,
-                phi,
-                feature_perturbation_codes[self.feature_perturbation],
-                output_transform_codes[transform],
-                False,
-            )
+            if self.algorithm == "quadrature":
+                _cext.dense_tree_quadrature_shap(
+                    self.model.children_left,
+                    self.model.children_right,
+                    self.model.children_default,
+                    self.model.features,
+                    self.model.thresholds,
+                    self.model.threshold_types,
+                    self.model.values,
+                    self.model.node_sample_weight,
+                    self.model.max_depth,
+                    X,
+                    X_missing,
+                    y,
+                    self.data,
+                    self.data_missing,
+                    tree_limit,
+                    self.model.base_offset,
+                    phi,
+                )
+            else:
+                _cext.dense_tree_shap(
+                    self.model.children_left,
+                    self.model.children_right,
+                    self.model.children_default,
+                    self.model.features,
+                    self.model.thresholds,
+                    self.model.threshold_types,
+                    self.model.values,
+                    self.model.node_sample_weight,
+                    self.model.max_depth,
+                    X,
+                    X_missing,
+                    y,
+                    self.data,
+                    self.data_missing,
+                    tree_limit,
+                    self.model.base_offset,
+                    phi,
+                    feature_perturbation_codes[self.feature_perturbation],
+                    output_transform_codes[transform],
+                    False,
+                )
         else:
             _cext.dense_tree_saabas(
                 self.model.children_left,

@@ -2389,6 +2389,28 @@ def test_tree_explainer_feature_perturbation_tree_path_dependent():
     assert np.abs(shap_sum - predictions).max() < 1e-4
 
 
+def test_quadrature_tree_shap_matches_classic():
+    """Quadrature-TreeSHAP should match classic Tree SHAP on path-dependent regression."""
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 5))
+    y = X[:, 0] * 2 + X[:, 1] - 0.5 * X[:, 2] + rng.normal(scale=0.1, size=200)
+
+    model = GradientBoostingRegressor(n_estimators=10, max_depth=4, random_state=0)
+    model.fit(X, y)
+
+    X_test = X[:20]
+    classic = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent", algorithm="classic")
+    quad = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent", algorithm="quadrature")
+
+    phi_classic = classic.shap_values(X_test)
+    phi_quad = quad.shap_values(X_test)
+
+    np.testing.assert_allclose(phi_quad, phi_classic, rtol=1e-4, atol=1e-4)
+
+    preds = model.predict(X_test)
+    assert np.max(np.abs(phi_quad.sum(1) + quad.expected_value - preds)) < 1e-4
+
+
 def test_tree_explainer_random_forest_binary_classification():
     """Test TreeExplainer with RandomForestClassifier for binary classification."""
     X = np.random.randn(150, 5)
