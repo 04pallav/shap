@@ -1,7 +1,7 @@
 # XGBoost categorical CPU TreeExplainer — PR code walkthrough
 
-Branch: `support/xgboost-categorical-cpu`  
-PR: https://github.com/04pallav/shap/pull/3  
+Branch: `support/xgboost-categorical-cpu`
+PR: https://github.com/04pallav/shap/pull/3
 Files: <code>shap/cext/tree_shap.h</code>, <code>shap/explainers/_tree.py</code>, <code>tests/explainers/test_tree.py</code>
 
 Each section shows before (`master`) and after (this PR) code with inline comments on every changed line.
@@ -117,7 +117,7 @@ inline unsigned tree_split_child(
     return right_child;                                                // SAME fallback as old else
 }
 ```
-> Why: XGB `Decision()` sends in-set categories to the right child (opposite of LightGBM).  
+> Why: XGB `Decision()` sends in-set categories to the right child (opposite of LightGBM).
 > Params must be `tfloat` (double), not `float` — master compared thresholds inline as doubles; `float` downcast broke near-tie numeric splits (e.g. iris `test_summary_bar_multiclass`).
 
 ---
@@ -247,7 +247,7 @@ def _xgboost_cat_unsupported(model: TreeEnsemble, feature_perturbation: str | No
         )
     # If we reach here: XGB cat + tree_path_dependent + type-2 nodes → _cext allowed
 ```
-> Before (master): any categorical column → `_cext` blocked even when we could fix it.  
+> Before (master): any categorical column → `_cext` blocked even when we could fix it.
 > After (this PR): allow `_cext` when loader set `threshold_types == 2`; still block interventional.
 
 ---
@@ -556,7 +556,7 @@ def transform_input(X, *, cat_feature_indices, dtype=np.float64):
         return arr
     return X
 ```
-> Before (master): column might hold `" Private"` (label) or `4.0` (code storage); tree splits on code `3`.  
+> Before (master): column might hold `" Private"` (label) or `4.0` (code storage); tree splits on code `3`.
 > After (this PR): always passes integer codes XGBoost trained on.
 
 ---
@@ -582,7 +582,7 @@ for node_id, node_cats in enumerate(tree_categories):
             threshold += 2 ** int(cat)                   # build XGB bitmask: sum of 2^code
         thresholds[node_id] = threshold
 ```
-> Before (master): cat node thresholds ignored; wrong split direction in C++.  
+> Before (master): cat node thresholds ignored; wrong split direction in C++.
 > After (this PR): matches XGBoost model JSON: `categories` list + bitmask threshold + type 2 in `_cext`.
 
 ---
