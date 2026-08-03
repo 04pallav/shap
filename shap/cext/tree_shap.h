@@ -1,8 +1,24 @@
 /**
- * Fast recursive computation of SHAP values in trees.
- * See https://arxiv.org/abs/1802.03888 for details.
+ * Tree SHAP — CPU implementation (header-only).
  *
- * Scott Lundberg, 2018 (independent algorithm courtesy of Hugh Chen 2018)
+ * Paper: https://arxiv.org/abs/1802.03888
+ *
+ * 04pallav: personal study notes — contributor-notes/SHAP_THEORY_README.md (C extension section)
+ *
+ *   Exact Shapley needs O(2^n) coalitions. Tree SHAP is O(T*L*D^2) because it:
+ *   1. Walks trees node-by-node instead of enumerating feature subsets.
+ *   2. At each split, "feature off" = recurse down the COLD child (weighted by
+ *      background fraction node_sample_weights[cold] / node_sample_weights[node]).
+ *      "Feature on"  = recurse down the HOT child (the branch this row's X takes).
+ *   3. Background is pre-summarized into node_sample_weights (see tree_update_weights).
+ *
+ * 04pallav: ENTRY POINTS:
+ *   dense_tree_shap()          — dispatcher (feature_dependence switch)
+ *   dense_tree_path_dependent() — case #2: background + path-dependent (most tree work)
+ *   dense_independent()        — interventional Shapley (tree_shap_indep)
+ *
+ * 04pallav: CORE RECURSION:
+ *   tree_shap_recursive() — implements Algorithm 2 from the paper (unique path + weights)
  */
 
 #include <algorithm>
@@ -23,12 +39,30 @@ using namespace std;
 typedef double tfloat;
 typedef tfloat (* transform_f)(const tfloat margin, const tfloat y);
 
+// =============================================================================
+// 04pallav: §1 DATA STRUCTURES
+//   FEATURE_DEPENDENCE — 0 interventional, 1 tree_path_dependent, 2 global
+//   TreeEnsemble       — flat tree arrays from Python
+//   ExplanationDataset — rows to explain (X) + optional background (R)
+//   PathElement        — one step on the unique path (Algorithm 2)
+// =============================================================================
+
+// 04pallav: maps to feature_perturbation= in Python TreeExplainer (_tree.py).
+//   independent (0)        → interventional Shapley — dense_independent / tree_shap_indep
+//   tree_path_dependent (1)→ path-dependent — dense_tree_path_dependent / tree_shap_recursive
+//   global_path_dependent (2) → merged-tree variant
 namespace FEATURE_DEPENDENCE {
     const unsigned independent = 0;
     const unsigned tree_path_dependent = 1;
     const unsigned global_path_dependent = 2;
 }
 
+// 04pallav: flattened boosted-tree model — all arrays built in Python _tree.py TreeEnsemble.
+//   features[i]              → which column splits at node i
+//   thresholds[i]            → numeric cutoff or categorical bitmask
+//   threshold_types[i]       → 0 numeric, 1 LightGBM cat
+//   values[i]                → leaf output (margin contribution)
+//   node_sample_weights[i]   → background row count through node i (v(∅) weighting)
 struct TreeEnsemble {
     int *children_left;
     int *children_right;
@@ -103,6 +137,9 @@ struct TreeEnsemble {
     }
 };
 
+// 04pallav: rows to explain (X) plus optional background (R).
+// Python passes background separately; by explain-time, background is usually already
+// folded into node_sample_weights via dense_tree_update_weights on init.
 struct ExplanationDataset {
     tfloat *X;
     bool *X_missing;
@@ -127,9 +164,10 @@ struct ExplanationDataset {
 };
 
 
-// data we keep about our decision path
-// note that pweight is included for convenience and is not tied with the other attributes
-// the pweight of the i'th path element is the permutation weight of paths with i-1 ones in them
+// 04pallav: one step on the "unique path" (Algorithm 2, Lundberg et al.).
+// Tracks which feature split we are at and what fraction of paths are on/off.
+//   zero_fraction / one_fraction — coalition weights for "feature off" vs "feature on"
+//   pweight — Shapley permutation weight for this path prefix
 struct PathElement {
     int feature_index;
     tfloat zero_fraction;
@@ -139,6 +177,13 @@ struct PathElement {
     PathElement(int i, tfloat z, tfloat o, tfloat w) :
         feature_index(i), zero_fraction(z), one_fraction(o), pweight(w) {}
 };
+
+// =============================================================================
+// 04pallav: §2 UTILITIES
+//   Output transforms (logistic, squared loss)
+//   category_in_threshold — LightGBM cat splits
+//   tree_predict          — walk tree for one row (same routing as HOT branch)
+// =============================================================================
 
 inline tfloat logistic_transform(const tfloat margin, const tfloat y) {
     return 1 / (1 + exp(-margin));
@@ -178,11 +223,15 @@ inline transform_f get_transform(unsigned model_transform) {
     return transform;
 }
 
+// 04pallav: LightGBM categorical — threshold is a bitmask, category levels are 1-based (2^(cat-1)).
+// threshold_types == 1 uses this; in-set categories go LEFT (see tree_predict below).
 inline bool category_in_threshold(float threshold, float category) {
     int category_flag = (1 << (int(category) - 1));
     return (int(threshold) & category_flag) != 0;
 }
 
+// 04pallav: walk one tree for one row x — same routing SHAP uses for the HOT (feature-on) branch.
+// Used by dense_tree_predict (additivity check in Python) and mirrors tree_shap_recursive hot_index.
 inline tfloat *tree_predict(unsigned i, const TreeEnsemble &trees, const tfloat *x, const bool *x_missing) {
     const unsigned offset = i * trees.max_nodes;
     unsigned node = 0;
@@ -207,6 +256,13 @@ inline tfloat *tree_predict(unsigned i, const TreeEnsemble &trees, const tfloat 
         }
     }
 }
+
+// =============================================================================
+// 04pallav: §3 SETUP / CHEAP BASELINES
+//   dense_tree_update_weights — count background through each node
+//   dense_tree_predict        — ensemble predict (additivity check)
+//   tree_saabas / dense_tree_saabas — fast approximation, not exact Shapley
+// =============================================================================
 
 inline void dense_tree_predict(tfloat *out, const TreeEnsemble &trees, const ExplanationDataset &data, unsigned model_transform) {
     tfloat *row_out = out;
@@ -246,6 +302,11 @@ inline void dense_tree_predict(tfloat *out, const TreeEnsemble &trees, const Exp
     }
 }
 
+// 04pallav: BACKGROUND PRE-COUNT (SHAP_THEORY_README optimization #3).
+// For one background row x, walk tree i and increment node_sample_weights at every node
+// on that path. Called for each background row in dense_tree_update_weights (Python init).
+// Later, tree_shap_recursive uses these counts as hot_zero_fraction / cold_zero_fraction
+// instead of looping background again for every coalition.
 inline void tree_update_weights(unsigned i, TreeEnsemble &trees, const tfloat *x, const bool *x_missing) {
     const unsigned offset = i * trees.max_nodes;
     unsigned node = 0;
@@ -344,7 +405,15 @@ inline void dense_tree_saabas(tfloat *out_contribs, const TreeEnsemble& trees, c
 }
 
 
-// extend our decision path with a fraction of one and zero extensions
+// =============================================================================
+// 04pallav: §4 CORE TREE SHAP — PATH-DEPENDENT
+//   extend_path / unwind_path / unwound_path_sum — path math
+//   tree_shap_recursive — heart: hot/cold children, accumulate φ
+//   tree_shap           — one tree, one row
+//   compute_expectations — internal node values from children
+// =============================================================================
+
+// 04pallav: extend decision path — book-keeping for Shapley averaging without enumerating 2^n coalitions.
 inline void extend_path(PathElement *unique_path, unsigned unique_depth,
                         tfloat zero_fraction, tfloat one_fraction, int feature_index) {
     unique_path[unique_depth].feature_index = feature_index;
@@ -407,7 +476,20 @@ inline tfloat unwound_path_sum(const PathElement *unique_path, unsigned unique_d
     }
     return total * (unique_depth + 1);
 }
-// recursive computation of SHAP values for a decision tree
+
+// ============================================================================
+// 04pallav: CORE — Tree SHAP recursion (Algorithm 2)
+//
+// At each internal node for the explained row x:
+//   HOT child  = branch x actually follows     → feature ON  at this split
+//   COLD child = other branch                  → feature OFF → merge subtrees
+//
+// hot_zero_fraction = node_sample_weight[hot]  / node_sample_weight[node]
+// cold_zero_fraction = node_sample_weight[cold] / node_sample_weight[node]
+//   (fraction of background that went each way — SHAP_THEORY_README "merge subtrees")
+//
+// phi[] accumulates per-feature Shapley values; last feature slot is bias.
+// ============================================================================
 inline void tree_shap_recursive(const unsigned num_outputs, const int *children_left,
                                 const int *children_right,
                                 const int *children_default, const int *features,
@@ -433,7 +515,7 @@ inline void tree_shap_recursive(const unsigned num_outputs, const int *children_
     }
     const unsigned split_index = features[node_index];
 
-    // leaf node
+    // 04pallav: ----- LEAF: distribute tree output to features on the unique path -----
     if (children_right[node_index] < 0) {
         for (unsigned i = 1; i <= unique_depth; ++i) {
             const tfloat w = unwound_path_sum(unique_path, unique_depth, i);
@@ -446,9 +528,9 @@ inline void tree_shap_recursive(const unsigned num_outputs, const int *children_
             }
         }
 
-    // internal node
+    // 04pallav: ----- INTERNAL NODE: hot/cold split -----
     } else {
-        // find which branch is "hot" (meaning x would follow it)
+        // 04pallav: HOT = branch this row's x follows (same rules as tree_predict)
         unsigned hot_index = 0;
         int type = threshold_types[node_index];
         if (x_missing[split_index]) {
@@ -464,6 +546,7 @@ inline void tree_shap_recursive(const unsigned num_outputs, const int *children_
         const unsigned cold_index = (static_cast<int>(hot_index) == children_left[node_index] ?
                                         children_right[node_index] : children_left[node_index]);
         const tfloat w = node_sample_weight[node_index];
+        // 04pallav: background fractions — zero_fraction when recursing (feature off = cold mix)
         const tfloat hot_zero_fraction = node_sample_weight[hot_index] / w;
         const tfloat cold_zero_fraction = node_sample_weight[cold_index] / w;
         tfloat incoming_zero_fraction = 1;
@@ -539,6 +622,7 @@ inline int compute_expectations(TreeEnsemble &tree, int i = 0, int depth = 0) {
     return max_depth;
 }
 
+// 04pallav: one tree, one row — add root expected value to bias column, then recurse from node 0.
 inline void tree_shap(const TreeEnsemble& tree, const ExplanationDataset &data,
                       tfloat *out_contribs, int condition, unsigned condition_feature) {
 
@@ -563,6 +647,11 @@ inline void tree_shap(const TreeEnsemble& tree, const ExplanationDataset &data,
     delete[] unique_path_data;
 }
 
+
+// =============================================================================
+// 04pallav: §5 MERGED-TREE PATH (global_path_dependent)
+//   build_merged_tree_* — fuse ensemble into one tree
+// =============================================================================
 
 inline unsigned build_merged_tree_recursive(TreeEnsemble &out_tree, const TreeEnsemble &trees,
                                      const tfloat *data, const bool *data_missing, int *data_inds,
@@ -723,8 +812,11 @@ inline void build_merged_tree(TreeEnsemble &out_tree, const ExplanationDataset &
 }
 
 
-// Independent Tree SHAP functions below here
-// ------------------------------------------
+// =============================================================================
+// 04pallav: §6 INTERVENTIONAL SHAPLEY (feature_dependence = 0)
+//   Node struct, tree_shap_indep, dense_independent
+// =============================================================================
+
 struct Node {
     short cl, cr, cd, pnode; // uint_16
     long feat, pfeat;
@@ -1281,8 +1373,24 @@ inline void dense_independent(const TreeEnsemble& trees, const ExplanationDatase
 }
 
 
+// =============================================================================
+// 04pallav: §7 PUBLIC ENTRY LOOPS (called from dense_tree_shap dispatcher)
+//   dense_tree_path_dependent          — background + tree_path_dependent (start here)
+//   dense_tree_interactions_path_dependent
+//   dense_global_path_dependent
+//   dense_tree_shap                    — picks §6 vs §7 path via feature_dependence
+// =============================================================================
+
 /**
- * This runs Tree SHAP with a per tree path conditional dependence assumption.
+ * 04pallav: tree_path_dependent Shapley — usual Tree SHAP path with background.
+ *
+ * For each row to explain (data.X):
+ *   For each tree in the ensemble:
+ *     tree_shap() → adds that tree's φ contribution
+ * Shapley values are linear over trees, so we sum per-tree results.
+ *
+ * Python: TreeExplainer(..., background, feature_perturbation="tree_path_dependent")
+ *         → _cext.dense_tree_shap(..., feature_dependence=1)
  */
 inline void dense_tree_path_dependent(const TreeEnsemble& trees, const ExplanationDataset &data,
                                tfloat *out_contribs, tfloat transform(const tfloat, const tfloat)) {
@@ -1449,7 +1557,12 @@ inline void dense_global_path_dependent(const TreeEnsemble& trees, const Explana
 
 
 /**
- * The main method for computing Tree SHAP on models using dense data.
+ * 04pallav: ENTRY POINT from Python (_cext.cc → _tree.py TreeExplainer.shap_values).
+ *
+ * feature_dependence selects which Shapley variant:
+ *   0 interventional      → dense_independent
+ *   1 tree_path_dependent → dense_tree_path_dependent  (house example in SHAP_THEORY_README)
+ *   2 global_path_dependent → dense_global_path_dependent
  */
 inline void dense_tree_shap(const TreeEnsemble& trees, const ExplanationDataset &data, tfloat *out_contribs,
                      const int feature_dependence, unsigned model_transform, bool interactions) {

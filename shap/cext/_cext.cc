@@ -1,5 +1,17 @@
 #define NPY_NO_DEPRECATED_API NPY_2_0_API_VERSION
 
+/*
+ * 04pallav: Python extension module for Tree SHAP (CPU).
+ *
+ * No Shapley math here — only numpy ↔ C marshalling.
+ * All algorithms live in tree_shap.h (see contributor-notes/SHAP_THEORY_README.md).
+ *
+ * Main path:
+ *   _tree.py TreeExplainer.shap_values()
+ *     → dense_tree_shap() in this file
+ *       → dense_tree_shap() in tree_shap.h
+ */
+
 #include <Python.h>
 #include <numpy/arrayobject.h>
 #include "tree_shap.h"
@@ -110,6 +122,8 @@ static PyObject *_cext_compute_expectations(PyObject *self, PyObject *args)
 }
 
 
+// 04pallav: called from _tree.py _cext.dense_tree_shap(...)
+// Unpacks tree arrays + X + background (R) + out_contribs buffer, then dispatches to tree_shap.h.
 static PyObject *_cext_dense_tree_shap(PyObject *self, PyObject *args)
 {
     PyObject *children_left_obj;
@@ -212,8 +226,7 @@ static PyObject *_cext_dense_tree_shap(PyObject *self, PyObject *args)
     tfloat *out_contribs = (tfloat*)PyArray_DATA(out_contribs_array);
     tfloat *base_offset = (tfloat*)PyArray_DATA(base_offset_array);
 
-    // these are just a wrapper objects for all the pointers and numbers associated with
-    // the ensemble tree model and the dataset we are explaining
+    // 04pallav: wrapper structs — pointers into numpy arrays owned by Python
     TreeEnsemble trees = TreeEnsemble(
         children_left, children_right, children_default, features, thresholds, threshold_types, values,
         node_sample_weights, max_depth, tree_limit, base_offset,

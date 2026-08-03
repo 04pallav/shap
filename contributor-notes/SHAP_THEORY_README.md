@@ -1,203 +1,255 @@
-# SHAP TreeExplainer — theory notes
-
-Personal reference for how `TreeExplainer` chooses algorithms, what “additivity” means, and how categorical splits are routed. Implementation tracker: [XGB_CATEGORICAL_FIX.md](./XGB_CATEGORICAL_FIX.md).
+# SHAP theory notes
 
 ---
 
-## 1. What TreeExplainer computes
+# Shapley theory
 
-For tree models, SHAP values attribute each feature’s contribution to the model output (margin / log-odds when `model_output="raw"`). For a single row:
+## The problem
 
-```
-model_output(x) ≈ expected_value + Σᵢ shapᵢ(x)
-```
+You have a model prediction and you want to know: **how much did each feature contribute?**
 
-`expected_value` is the mean model output over the background set (when background is provided) or derived from tree structure (no background).
+Shapley's rule for one feature:
 
-**Additivity** is this identity holding row-by-row. SHAP enforces it in `assert_additivity` by comparing `sum(shap) + expected_value` to **`TreeEnsemble.predict(X)`** — SHAP’s own C++ tree walk — not necessarily the booster library’s native `predict`.
+1. List **every feature set that does not include it** → call each set **S**
+2. For each set, ask: **if I turn this feature on, how much does the score go up?** → the **bump**
+3. **Average** those bumps → that's the feature's fair share → **φ** (phi)
+
+Do that for every feature.
+
+## Why 2 to the power of n
+
+Each feature is either **on** or **off**. Two choices per feature → **2ⁿ** combos total.
+
+- 2 features → 4 combos
+- Each feature is checked against **2^(n−1)** sets that exclude it → 2 sets when n = 2
+
+You need a score for **every** combo — written **v(S)**. That's the expensive part.
+
+**v(S)** = score when exactly the features in S are on.  
+**∅** = empty set = nothing on.
+
+### Time complexity — exact Shapley
+
+**O(2ⁿ)** in the number of features **n** — one **v(S)** per combo.  
+20 features → ~1 million combos. Each combo may need a full model prediction → impractical for large **n**.
+
+## Worked example — feature A (with B in the mix)
+
+
+| What's on | S      | A   | B   | Score | v(S) |
+| --------- | ------ | --- | --- | ----- | ---- |
+| nothing   | ∅      | off | off | 0     | 0    |
+| A only    | {A}    | on  | off | 3     | 3    |
+| B only    | {B}    | off | on  | 5     | 5    |
+| both      | {A, B} | on  | on  | 10    | 10   |
+
+
+Every set **without A** — average what A adds:
+
+
+| Set without A | S   | Score (A off) | v(S) | Score (A on) | v(S ∪ {A}) | bump           |
+| ------------- | --- | ------------- | ---- | ------------ | ---------- | -------------- |
+| nothing       | ∅   | 0             | 0    | 3            | 3          | 3 − 0 = **3**  |
+| B only        | {B} | 5             | 5    | 10           | 10         | 10 − 5 = **5** |
+
+
+In notation the bumps are: v({A}) − v(∅) = 3 and v({A,B}) − v({B}) = 5
+
+**A's fair share → φ_A = (3 + 5) / 2 = 4**
+
+Same steps for every other feature. All shares must add up to the full prediction minus baseline:
+
+both on minus nothing → v({A,B}) − v(∅) = 10 − 0 = **10**  
+or in notation: **φ_A + φ_B = 10**
+
+With 2 features every bump has weight **½** — plain average.
+
+## ML model — house price example (2 features)
+
+The toy example had features literally **on** or **off**. A real model always needs a full input row. So the question becomes: **when a feature is "off", what value does the model see?**
+
+You never set sqft to 0 or delete a column. "Off" means **not fixed to this house** — the value is filled from a **background dataset** (sample of training houses).
+
+Stick to **2 features** — sqft and bedrooms — same as A and B above.
+
+### Setup
+
+**Background average house** (stands in for any feature that is "off"):
+
+
+| Feature  | Avg value |
+| -------- | --------- |
+| sqft     | 1500      |
+| bedrooms | 3         |
+
+
+**This house** (the row we explain):
+
+
+| Feature  | Value |
+| -------- | ----- |
+| sqft     | 2000  |
+| bedrooms | 4     |
+
+
+In real SHAP, background is many rows and we average predictions. Here we use **one average row** to keep the numbers simple.
+
+### What v(S) means now
+
+**S** = which features stay fixed to **this house**. Everything else uses the **background average**.
+
+
+| What's on     | S                | Model input (sqft, bed) | v(S) |
+| ------------- | ---------------- | ----------------------- | ---- |
+| nothing       | ∅                | 1500, 3 (avg)           | 300  |
+| sqft only     | {sqft}           | 2000, 3                 | 340  |
+| bedrooms only | {bedrooms}       | 1500, 4                 | 320  |
+| both          | {sqft, bedrooms} | 2000, 4                 | 400  |
+
+
+**v(S)** = `model.predict(...)` for that row. (With many background rows, average those predictions instead.)
+
+### φ_sqft — every set without sqft
+
+
+| Set without sqft | S          | v(S) | v(S ∪ {sqft}) | bump               |
+| ---------------- | ---------- | ---- | ------------- | ------------------ |
+| nothing          | ∅          | 300  | 340           | 340 − 300 = **40** |
+| bedrooms only    | {bedrooms} | 320  | 400           | 400 − 320 = **80** |
+
+
+**φ_sqft = (40 + 80) / 2 = 60**
+
+### φ_bedrooms — every set without bedrooms
+
+
+| Set without bedrooms | S      | v(S) | v(S ∪ {bedrooms}) | bump               |
+| -------------------- | ------ | ---- | ----------------- | ------------------ |
+| nothing              | ∅      | 300  | 320               | 320 − 300 = **20** |
+| sqft only            | {sqft} | 340  | 400               | 400 − 340 = **60** |
+
+
+**φ_bedrooms = (20 + 60) / 2 = 40**
+
+**expected_value** ≈ **v(∅) = 300**
+
+**Additivity:** 300 + 60 + 40 = **400** = prediction for this house ✓
 
 ---
 
-## 2. The two axes that matter
+# Tree SHAP
 
-Every `TreeExplainer` call sits at a point in this grid:
+Exact Shapley loops over **2ⁿ** combos (4 in the house example). **Tree SHAP** computes the same **φ** values without that loop by walking the tree:
 
-| Axis | Options | Default |
-|------|---------|---------|
-| **Background** | None vs provided `data` | None |
-| **Perturbation** | `tree_path_dependent` vs `interventional` | `auto` |
+- Feature **on** → use this house's value at each split
+- Feature **off** → split the path: weight left/right children by how many background houses went that way
 
-### `feature_perturbation="auto"` (`_tree.py:294–295`)
+"Off" still means **not committed to this house's value** — not zero, not missing.
+
+## Why Tree SHAP is cheap
+
+Exact Shapley treats the model as a **black box** — score every on/off combo → **O(2ⁿ)**. Tree SHAP opens the box and uses three optimizations.
+
+### 1. Coalitions → tree walks
+
+**Exact Shapley** builds arbitrary combos: {sqft}, {bedrooms}, {both}, {nothing}. The model must be scored on each — even though a tree never works that way.
+
+**A tree only asks one question per node**, in a fixed order. Example:
+
+```
+root: sqft ≤ 1800?
+├─ yes → bedrooms ≤ 3?
+│         ├─ yes → leaf $280k
+│         └─ no  → leaf $350k
+└─ no  → leaf $400k
+```
+
+To predict **this house** (2000 sqft, 4 bed): walk **3 steps** → one leaf. You never build a fake row with "sqft on, bedrooms off" as a separate `predict` call — the tree structure already defines how features combine.
+
+**Tree SHAP does the same kind of walk** to hand out credit. It recurses through these nodes and accumulates each feature's **φ** along the way. Work ≈ **steps in the tree**, not **2ⁿ coalitions**.
+
+### 2. "Feature off" = merge subtrees
+
+Exact Shapley with bedrooms **off** still needs a bedroom value for every coalition (from background). That sounds like many different inputs.
+
+At the node `bedrooms ≤ 3?`, Tree SHAP asks a different question: **"we haven't fixed bedrooms for this house yet — what would the subtree outputs be on average?"**
+
+- **Left child** (≤3 bed): average leaf value over background houses that went left, weighted by count
+- **Right child** (>3 bed): same for houses that went right
+- **Merge**: weighted sum of the two children — one number for "bedrooms still unknown"
+
+So one split is handled by **combining two subtrees**, not by scoring 2ⁿ bedroom combos. When bedrooms flips to **on**, you follow **this house's** path (4 bed → right). When **off**, you keep the merged mix.
+
+That's how "feature off" avoids exponential work: **uncertainty = blend children**, not enumerate all coalitions.
+
+### 3. Background counted once
+
+Naive Shapley + background: for every coalition, loop all 100 background houses, build a row, `predict`, average → huge.
+
+**Tree SHAP pre-counts at init:**
+
+| Node | Question | background houses that reached here |
+|------|----------|-------------------------------------|
+| root | sqft ≤ 1800? | 100 |
+| left | bedrooms ≤ 3? | 60 went left, 40 went right |
+| leaf | — | e.g. 25 houses in this leaf |
+
+Those counts are **`node_sample_weight`** — stored on the tree. Explaining this house (2000 sqft, 4 bed) **reuses** them; it never re-loops 100 houses at every coalition.
+
+Init: count background once per node. Explain: walk tree + merge with stored weights.
+
+### Toy contrast (sqft + bedrooms)
+
+
+| Approach      | Work                                                                            |
+| ------------- | ------------------------------------------------------------------------------- |
+| Exact Shapley | 4 coalitions × full `predict`                                                   |
+| Tree SHAP     | Walk each tree (~depth steps); at each split, combine two children with weights |
+
+
+Same **φ** (path-dependent), but work scales with **tree size**, not **2ⁿ**.
+
+### Time complexity — Tree SHAP
+
+**Polynomial** in tree size — **not** O(2ⁿ). Per row explained, roughly **O(T · L · D²)**:
+
+
+| Symbol | Meaning             |
+| ------ | ------------------- |
+| **T**  | number of trees     |
+| **L**  | max leaves per tree |
+| **D**  | max depth           |
+
+
+Same Shapley **φ** values (for tree_path_dependent), feasible on models with hundreds of features. Applies **with or without** background — background weights are pre-aggregated at init, not a 2ⁿ loop per row.
+
+## In code
 
 ```python
-feature_perturbation = "interventional" if self.data is not None else "tree_path_dependent"
-```
-
-- **No background** → `tree_path_dependent`
-- **With background** → `interventional`
-
-To hit path-dependent SHAP with a background (case **#2** below), pass **`feature_perturbation="tree_path_dependent"` explicitly**.
-
-### Perturbation semantics (informal)
-
-| Mode | Idea | Needs background? |
-|------|------|-------------------|
-| **`tree_path_dependent`** | Feature is present or absent along the path the tree actually took; conditional expectations follow tree structure | No (but can use one) |
-| **`interventional`** | Break correlations: marginalize each feature over the background distribution independently | Yes (warns / falls back if missing) |
-
-These are **different algorithms**. SHAP values from #1 and #2 are not comparable even on the same model.
-
----
-
-## 3. The six-path matrix
-
-Grid: **engine × perturbation × background**. Omitted cell: `interventional` without background — SHAP emits `FutureWarning` and silently switches to `tree_path_dependent` (same as #1 / #4).
-
-### Case numbers (same for every library)
-
-| # | Engine | Perturbation | Background | Typical code path |
-|---|--------|--------------|------------|-------------------|
-| 1 | CPU | `tree_path_dependent` | No | Native `pred_contribs` shortcut |
-| 2 | CPU | `tree_path_dependent` | Yes | `_cext` (`dense_tree_shap`) |
-| 3 | CPU | `interventional` | Yes | `_cext` (`tree_shap_indep`) |
-| 4 | GPU | `tree_path_dependent` | No | Booster GPU contrib or `_cext_gpu` |
-| 5 | GPU | `tree_path_dependent` | Yes | `_cext_gpu` |
-| 6 | GPU | `interventional` | Yes | `_cext_gpu` interventional |
-
-### Shortcut gate (`_tree.py:715–724`)
-
-`pred_contribs` / `pred_contrib` shortcut runs only when **all** of:
-
-1. `feature_perturbation == "tree_path_dependent"`
-2. `model_type` is xgboost / lightgbm / catboost (not `internal`)
-3. **`self.data is None`** (no background)
-
-Any background forces `_cext` for path-dependent mode.
-
----
-
-## 4. Code paths (CPU)
-
-```
-TreeExplainer.shap_values(X)
-│
-├─ #1  tree_path_dependent + no background
-│      └─ _short_circuit_tree_path_dependent_to_external_shap_calculation()
-│         ├─ XGBoost: booster.predict(..., pred_contribs=True)
-│         ├─ LightGBM: booster.predict(..., pred_contrib=True)
-│         └─ CatBoost: get_feature_importance(..., ShapValues)
-│
-├─ #2  tree_path_dependent + background
-│      └─ _cext.dense_tree_shap  (tree_shap_recursive in tree_shap.h)
-│
-└─ #3  interventional + background
-       └─ _cext.dense_tree_shap  (tree_shap_indep in tree_shap.h)
-```
-
-GPU mirror: `GPUTreeExplainer` → `_cext_gpu` for #4–6.
-
----
-
-## 5. Categorical split routing (`tree_shap.h`)
-
-`threshold_types` on each split node:
-
-| Type | Library | Bitmask | In-set goes |
-|------|---------|---------|-------------|
-| `0` | all | numeric threshold | left if `x ≤ thres` |
-| `1` | LightGBM | `2^(cat−1)` | **left** |
-| `2` | XGBoost | `2^cat` (0-based code) | **right** |
-
-Shared entry point: `tree_split_child()` — used by both **predict** and **SHAP** in `_cext`.
-
-**Input encoding:** trees split on integer category **codes** (0…k−1), not arbitrary label values. Mismatch between training codes and explain-time values → wrong leaf → broken SHAP.
-
-### Known LGBM edge case (cat code 0)
-
-LightGBM loader builds bitmask with `2 ** (cat - 1)`. Category **0** gives `2^(-1)` — invalid / wrong in C++ (`1 << -1`). Empirically: `TreeEnsemble.predict` can diverge from native LightGBM `predict(raw_score=True)` on rows with cat=0, while **internal** additivity (`check_additivity=True` vs `TreeEnsemble.predict`) still passes. No-bg path avoids this by using LightGBM’s own `pred_contrib`.
-
-XGB type-2 uses **0-based** `2^cat` — aligned with `enable_categorical` + `cat.codes`.
-
----
-
-## 6. Validation — which oracle to use
-
-**Do not** compare SHAP values across different cases (#1 vs #2, or path-dependent vs interventional). Different definitions.
-
-| Case | Valid oracle | Invalid oracle |
-|------|--------------|----------------|
-| #1 no-bg path-dependent | Native `pred_contribs` (optional cross-check) | Background path SHAP |
-| #2 bg path-dependent | `check_additivity=True` (vs `TreeEnsemble.predict`) | Native booster predict if `TreeEnsemble.predict` diverges |
-| #3 interventional | `check_additivity=True` | `pred_contribs` |
-| #5 GPU path-dependent | `assert_gpu_matches_cpu` vs CPU #2 | — |
-
-**Per-feature correctness** (golden SHAP per feature) has no cheap external oracle on #2/#3 — only row-level additivity + (for GPU) CPU parity. Brute-force tree SHAP exists in tests for tiny synthetic numeric trees only.
-
-### LightGBM #3 failure mode (upstream, pre-fix)
-
-`tree_shap_indep` uses numeric `x > threshold` only — ignores `threshold_types == 1`. Symptom: categorical feature SHAP = 0, additivity fails vs model output. Confirms #3 needs C++ work separate from categorical plumbing in #2.
-
----
-
-## 7. Library status snapshot (Mar 2026)
-
-### LightGBM categorical (#4171 / #5020)
-
-| # | Status | Notes |
-|---|--------|-------|
-| 1 | ✅ Works | `pred_contrib` shortcut |
-| 2 | ✅ Works | `_cext` path-dependent; `check_additivity=True` passes |
-| 3 | ❌ Broken | `tree_shap_indep` no cat routing; cat SHAP = 0 |
-| 4–6 | GPU track | See #5020 / #5026 |
-
-### XGBoost categorical (`enable_categorical=True`)
-
-| # | Status | Notes |
-|---|--------|-------|
-| 1 | ✅ Works | `pred_contribs` since XGB 1.7+ |
-| 2 | 🚧 PR [#5107](https://github.com/shap/shap/pull/5107) | `threshold_types=2`, cat codes, additivity vs `output_margin` |
-| 3 | ❌ Not in PR | Same `tree_shap_indep` gap as LGBM |
-| 4–6 | ❌ Not in PR | `_cext_gpu` touched, not CUDA-validated |
-
----
-
-## 8. Minimal API recipes
-
-```python
-# Case #1 — no background, path-dependent (default)
-explainer = shap.TreeExplainer(model)
-# or explicitly:
-explainer = shap.TreeExplainer(model, feature_perturbation="tree_path_dependent")
-
-# Case #2 — background + path-dependent (_cext) — NOT default
 explainer = shap.TreeExplainer(
-    model, background, feature_perturbation="tree_path_dependent"
+    model,
+    background_houses,
+    feature_perturbation="tree_path_dependent",
 )
-
-# Case #3 — background + interventional (default when background given)
-explainer = shap.TreeExplainer(model, background)
-# or:
-explainer = shap.TreeExplainer(model, background, feature_perturbation="interventional")
+phi = explainer.shap_values(this_house)  # [φ_sqft, φ_bedrooms]
 ```
 
----
+Default `TreeExplainer(model, background)` uses **interventional** Shapley — same coalition idea, different rule for filling "off" features (each filled independently from background). **tree_path_dependent** matches the path-walking description above.
 
-## 9. Related docs
+## Execution path — init vs `shap_values`
 
-| Doc | Purpose |
-|-----|---------|
-| [XGB_CATEGORICAL_FIX.md](./XGB_CATEGORICAL_FIX.md) | XGB implementation tracker, repro scripts, issue map |
-| [OPEN_PRS.md](./OPEN_PRS.md) | Fork / upstream PR status |
+### `TreeExplainer(..., background)` — init
 
----
+- Python builds `TreeEnsemble` with background rows
+- Each tree calls **`dense_tree_update_weights`** → walks every background row, increments **`node_sample_weight[i]`** at each node it hits
+- **Not feature averages** — **counts** (how many background houses went left/right at each split)
+- Also computes **`expected_value`** ≈ mean prediction over background (**v(∅)**)
 
-## 10. Key source locations
+### `explainer.shap_values(this_house)` — explain
 
-| Topic | File | Lines (approx) |
-|-------|------|----------------|
-| `auto` perturbation | `shap/explainers/_tree.py` | 294–295 |
-| Shortcut gate | `shap/explainers/_tree.py` | 715–724 |
-| Additivity check | `shap/explainers/_tree.py` | 779–780, 955–973 |
-| LGBM cat loader | `shap/explainers/_tree.py` | 2052–2061 |
-| Cat routing C++ | `shap/cext/tree_shap.h` | 181–211 |
-| XGB cat guard | `shap/explainers/_tree.py` | 112–149 |
+- **`dense_tree_shap`** → **`dense_tree_path_dependent`**
+- For each row × each tree → **`tree_shap`** → **`tree_shap_recursive`**
+- Uses **pre-stored** `node_sample_weights` for hot/cold fractions — **no background loop here**
+- Optionally **`tree_predict`** for additivity check
+
+**Summary:** init = pre-count background through the tree; `shap_values` = explain this house using those counts.
